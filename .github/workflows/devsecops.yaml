@@ -94,7 +94,7 @@ jobs:
             # Pakai versi 0.36.0 (setelah insiden supply chain Maret 2026).
             # Lebih aman lagi: ganti dengan commit SHA lengkap + komentar versi.
             - name: Trivy Scan Image
-              uses: aquasecurity/trivy-action@0.36.0
+              uses: aquasecurity/trivy-action@v0.36.0
               with:
                   image-ref: devsecops-app:${{ github.sha }}
                   format: table
