@@ -1,4 +1,4 @@
-name: DevSecOps CI Pipeline
+name: DevSecOps CI/CD Pipeline
 
 on:
     push:
@@ -12,6 +12,7 @@ permissions:
     pull-requests: read
 
 jobs:
+    # ======================= CI STAGE =======================
     sast-scan:
         name: Semgrep SAST Scan
         runs-on: ubuntu-latest
@@ -79,7 +80,7 @@ jobs:
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-    # ---- Container Stage: build + scan saja (belum push, belum deploy) ----
+    # ---- Container Stage: build + scan ----
     image-scan:
         name: Build Image & Trivy Scan
         needs: [sast-scan, pylint-check, sca-scan, secret-scan]
@@ -103,9 +104,84 @@ jobs:
                   vuln-type: os,library
                   exit-code: "1"
 
+    # ======================= CD STAGE =======================
+    # Hanya jalan pada push ke main/master (BUKAN pull request),
+    # karena runner self-hosted mengeksekusi kode langsung di server.
+    push-image:
+        name: Push Image ke GHCR
+        needs: [image-scan]
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+            packages: write
+        steps:
+            - name: Checkout Source Code
+              uses: actions/checkout@v4
+
+            - name: Login ke GHCR
+              uses: docker/login-action@v3
+              with:
+                  registry: ghcr.io
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - name: Build & Push Image
+              run: |
+                  IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+                  docker build -t "$IMAGE:${GITHUB_SHA}" -t "$IMAGE:latest" .
+                  docker push --all-tags "$IMAGE"
+
+    deploy:
+        name: Deploy ke Server (Self-hosted Runner)
+        needs: [push-image]
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        runs-on: [self-hosted, Linux, X64]
+        permissions:
+            contents: read
+            packages: read
+        concurrency:
+            group: deploy-production
+            cancel-in-progress: false
+        steps:
+            - name: Login ke GHCR
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  ACTOR: ${{ github.actor }}
+              run: echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+
+            - name: Pull & Jalankan Container Baru
+              run: |
+                  IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}"
+                  docker pull "$IMAGE"
+                  docker rm -f devsecops-app 2>/dev/null || true
+                  docker run -d --name devsecops-app \
+                      --restart unless-stopped \
+                      -p 5000:5000 "$IMAGE"
+
+            - name: Health Check
+              run: |
+                  for i in 1 2 3 4 5 6 7 8 9 10; do
+                      if curl -fsS http://localhost:5000/ > /dev/null; then
+                          echo "Aplikasi berjalan."
+                          exit 0
+                      fi
+                      sleep 3
+                  done
+                  echo "Health check gagal."
+                  docker logs devsecops-app
+                  exit 1
+
+            - name: Bersih-bersih
+              if: always()
+              run: |
+                  docker logout ghcr.io
+                  docker image prune -f
+
+    # ======================= NOTIFIKASI =======================
     notify-discord:
         name: Notify Discord
-        needs: [sast-scan, pylint-check, sca-scan, secret-scan, image-scan]
+        needs: [sast-scan, pylint-check, sca-scan, secret-scan, image-scan, push-image, deploy]
         if: always()
         runs-on: ubuntu-latest
         steps:
@@ -117,6 +193,8 @@ jobs:
                   SCA: ${{ needs.sca-scan.result }}
                   SECRET: ${{ needs.secret-scan.result }}
                   TRIVY: ${{ needs.image-scan.result }}
+                  PUSH: ${{ needs.push-image.result }}
+                  DEPLOY: ${{ needs.deploy.result }}
                   REPO: ${{ github.repository }}
                   BRANCH: ${{ github.head_ref || github.ref_name }}
                   ACTOR: ${{ github.actor }}
@@ -139,7 +217,13 @@ jobs:
                       esac
                   }
 
-                  if [ "$SAST" = "success" ] && [ "$PYLINT" = "success" ] && [ "$SCA" = "success" ] && [ "$SECRET" = "success" ] && [ "$TRIVY" = "success" ]; then
+                  # Tahap CI wajib success. Tahap CD boleh success atau skipped
+                  # (skipped = pull request / branch lain, memang tidak di-deploy).
+                  # Jika push-image gagal, deploy ikut skipped, tapi PUSH=failure
+                  # tetap membuat pipeline ditandai GAGAL.
+                  if [ "$SAST" = "success" ] && [ "$PYLINT" = "success" ] && [ "$SCA" = "success" ] && [ "$SECRET" = "success" ] && [ "$TRIVY" = "success" ] \
+                      && { [ "$PUSH" = "success" ] || [ "$PUSH" = "skipped" ]; } \
+                      && { [ "$DEPLOY" = "success" ] || [ "$DEPLOY" = "skipped" ]; }; then
                       COLOR=3066993
                       TITLE="✅ Pipeline LOLOS"
                   else
@@ -164,6 +248,8 @@ jobs:
                       --arg sca "$(icon "$SCA")" \
                       --arg secret "$(icon "$SECRET")" \
                       --arg trivy "$(icon "$TRIVY")" \
+                      --arg push "$(icon "$PUSH")" \
+                      --arg deploy "$(icon "$DEPLOY")" \
                       --arg ai "$AI" \
                       '{embeds: [{
                           title: $title, url: $url, color: $color,
@@ -173,7 +259,9 @@ jobs:
                               {name: "Pylint (kualitas)", value: $pylint, inline: true},
                               {name: "pip-audit (SCA)", value: $sca, inline: true},
                               {name: "Gitleaks (secret)", value: $secret, inline: true},
-                              {name: "Trivy (image)", value: $trivy, inline: true}
+                              {name: "Trivy (image)", value: $trivy, inline: true},
+                              {name: "Push (GHCR)", value: $push, inline: true},
+                              {name: "Deploy (server)", value: $deploy, inline: true}
                           ] + (if $ai != "" then [{name: "Analisis AI (Gemini)", value: $ai}] else [] end))
                       }]}')
 
