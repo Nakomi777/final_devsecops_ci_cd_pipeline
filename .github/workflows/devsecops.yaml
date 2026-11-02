@@ -79,9 +79,33 @@ jobs:
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+    # ---- Container Stage: build + scan saja (belum push, belum deploy) ----
+    image-scan:
+        name: Build Image & Trivy Scan
+        needs: [sast-scan, pylint-check, sca-scan, secret-scan]
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout Source Code
+              uses: actions/checkout@v4
+
+            - name: Build Docker Image
+              run: docker build -t devsecops-app:${{ github.sha }} .
+
+            # Pakai versi 0.36.0 (setelah insiden supply chain Maret 2026).
+            # Lebih aman lagi: ganti dengan commit SHA lengkap + komentar versi.
+            - name: Trivy Scan Image
+              uses: aquasecurity/trivy-action@0.36.0
+              with:
+                  image-ref: devsecops-app:${{ github.sha }}
+                  format: table
+                  severity: CRITICAL,HIGH
+                  ignore-unfixed: true
+                  vuln-type: os,library
+                  exit-code: "1"
+
     notify-discord:
         name: Notify Discord
-        needs: [sast-scan, pylint-check, sca-scan, secret-scan]
+        needs: [sast-scan, pylint-check, sca-scan, secret-scan, image-scan]
         if: always()
         runs-on: ubuntu-latest
         steps:
@@ -92,6 +116,7 @@ jobs:
                   PYLINT: ${{ needs.pylint-check.result }}
                   SCA: ${{ needs.sca-scan.result }}
                   SECRET: ${{ needs.secret-scan.result }}
+                  TRIVY: ${{ needs.image-scan.result }}
                   REPO: ${{ github.repository }}
                   BRANCH: ${{ github.head_ref || github.ref_name }}
                   ACTOR: ${{ github.actor }}
@@ -114,7 +139,7 @@ jobs:
                       esac
                   }
 
-                  if [ "$SAST" = "success" ] && [ "$PYLINT" = "success" ] && [ "$SCA" = "success" ] && [ "$SECRET" = "success" ]; then
+                  if [ "$SAST" = "success" ] && [ "$PYLINT" = "success" ] && [ "$SCA" = "success" ] && [ "$SECRET" = "success" ] && [ "$TRIVY" = "success" ]; then
                       COLOR=3066993
                       TITLE="✅ Pipeline LOLOS"
                   else
@@ -138,6 +163,7 @@ jobs:
                       --arg pylint "$(icon "$PYLINT")" \
                       --arg sca "$(icon "$SCA")" \
                       --arg secret "$(icon "$SECRET")" \
+                      --arg trivy "$(icon "$TRIVY")" \
                       --arg ai "$AI" \
                       '{embeds: [{
                           title: $title, url: $url, color: $color,
@@ -146,7 +172,8 @@ jobs:
                               {name: "Semgrep (SAST)", value: $sast, inline: true},
                               {name: "Pylint (kualitas)", value: $pylint, inline: true},
                               {name: "pip-audit (SCA)", value: $sca, inline: true},
-                              {name: "Gitleaks (secret)", value: $secret, inline: true}
+                              {name: "Gitleaks (secret)", value: $secret, inline: true},
+                              {name: "Trivy (image)", value: $trivy, inline: true}
                           ] + (if $ai != "" then [{name: "Analisis AI (Gemini)", value: $ai}] else [] end))
                       }]}')
 
